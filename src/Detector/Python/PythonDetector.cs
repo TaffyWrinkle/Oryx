@@ -4,9 +4,11 @@
 // --------------------------------------------------------------------------------------------
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Oryx.Common.Extensions;
 
@@ -35,27 +37,29 @@ namespace Microsoft.Oryx.Detector.Python
         public PlatformDetectorResult Detect(DetectorContext context)
         {
             var sourceRepo = context.SourceRepo;
-
-            var isPythonApp = IsPythonApp(sourceRepo);
+            var isPythonApp = IsPythonApp(sourceRepo, out string directory);
 
             // This detects if a runtime.txt file exists and if that is a python file
             var versionFromRuntimeFile = DetectPythonVersionFromRuntimeFile(context.SourceRepo);
             if (!isPythonApp && string.IsNullOrEmpty(versionFromRuntimeFile))
             {
                 return null;
-            }
+            }  
 
             return new PlatformDetectorResult
             {
                 Platform = PythonConstants.PlatformName,
                 PlatformVersion = versionFromRuntimeFile,
+                Directory = directory,
             };
         }
 
-        private bool IsPythonApp(ISourceRepo sourceRepo)
+        private bool IsPythonApp(ISourceRepo sourceRepo, out string directory)
         {
+            directory = string.Empty;
             if (sourceRepo.FileExists(PythonConstants.RequirementsFileName))
             {
+                directory = Constants.RelativeRootDirectory;
                 _logger.LogInformation($"Found {PythonConstants.RequirementsFileName} at the root of the repo.");
                 return true;
             }
@@ -74,6 +78,7 @@ namespace Microsoft.Oryx.Detector.Python
             var files = sourceRepo.EnumerateFiles(PythonConstants.PythonFileNamePattern, searchSubDirectories);
             if (files != null && files.Any())
             {
+                directory = RelativeDirectoryHelper.GetRelativeDirectoryToRoot(files.FirstOrDefault(), sourceRepo.RootPath);
                 _logger.LogInformation(
                     $"Found files with extension '{PythonConstants.PythonFileNamePattern}' " +
                     $"in the repo.");
