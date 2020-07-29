@@ -4,22 +4,15 @@
 # Licensed under the MIT license.
 # --------------------------------------------------------------------------------------------
 
-set -e
+set -ex
 
 declare -r REPO_DIR=$( cd $( dirname "$0" ) && cd .. && pwd )
 
 # Load all variables
 source $REPO_DIR/build/__variables.sh
 source $REPO_DIR/build/__functions.sh
-source $REPO_DIR/build/__pythonVersions.sh # For PYTHON_BASE_TAG
-source $REPO_DIR/build/__phpVersions.sh    # For PHP_BUILD_BASE_TAG
-source $REPO_DIR/build/__nodeVersions.sh   # For YARN_CACHE_BASE_TAG
-source $REPO_DIR/build/__nodeVersions.sh   # For YARN_CACHE_BASE_TAG
 source $REPO_DIR/build/__sdkStorageConstants.sh
-
-declare -r BASE_TAG_BUILD_ARGS="--build-arg PYTHON_BASE_TAG=$PYTHON_BASE_TAG \
-                                --build-arg PHP_BUILD_BASE_TAG=$PHP_BUILD_BASE_TAG \
-                                --build-arg YARN_CACHE_BASE_TAG=$YARN_CACHE_BASE_TAG" \
+source $REPO_DIR/build/__nodeVersions.sh # for YARN_CACHE_BASE_TAG
 
 cd "$BUILD_IMAGES_BUILD_CONTEXT_DIR"
 
@@ -36,17 +29,8 @@ else
     mkdir -p $BUILD_IMAGES_BUILD_CONTEXT_DIR/binaries
 fi
 
-# Avoid causing cache invalidation with the following check
-if [ "$EMBED_BUILDCONTEXT_IN_IMAGES" == "true" ]
-then
-	buildMetadataArgs="--build-arg GIT_COMMIT=$GIT_COMMIT"
-	buildMetadataArgs="$buildMetadataArgs --build-arg BUILD_NUMBER=$BUILD_NUMBER"
-	buildMetadataArgs="$buildMetadataArgs --build-arg RELEASE_TAG_NAME=$RELEASE_TAG_NAME"
-	echo "Build metadata args: $buildMetadataArgs"
-fi
-
-storageArgs="--build-arg SDK_STORAGE_ENV_NAME=$SDK_STORAGE_BASE_URL_KEY_NAME"
-storageArgs="$storageArgs --build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL"
+# NOTE: We use only one label and put all information in it in order to limit the number of layers that are created
+labelContent="git_commit=$GIT_COMMIT, build_number=$BUILD_NUMBER, release_tag_name=$RELEASE_TAG_NAME"
 
 # https://medium.com/@Drew_Stokes/bash-argument-parsing-54f3b81a6a8f
 PARAMS=""
@@ -87,8 +71,7 @@ function BuildAndTagStage()
 	docker build \
 		--target $stageName \
 		-t $stageTagName \
-		$buildMetadataArgs \
-		$BASE_TAG_BUILD_ARGS \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$dockerFile" \
 		.
 }
@@ -107,9 +90,7 @@ function buildDockerImage() {
 	# to be pushed. This is just a workaround to prevent having dangling images so that
 	# when a cleanup operation is being done on a build agent, a valuable dangling image
 	# is not removed.
-	BuildAndTagStage "$dockerFileToBuild" node-install
-	BuildAndTagStage "$dockerFileToBuild" dotnet-install
-	BuildAndTagStage "$dockerFileToBuild" python
+	BuildAndTagStage "$dockerFileToBuild" pre-final
 
 	# If no tag was provided, use a default tag of "latest"
 	if [ -z "$dockerImageBaseTag" ]
@@ -119,11 +100,9 @@ function buildDockerImage() {
 
 	builtImageTag="$dockerImageRepoName:$dockerImageBaseTag"
 	docker build -t $builtImageTag \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
-		$BASE_TAG_BUILD_ARGS \
 		--build-arg AI_KEY=$APPLICATION_INSIGHTS_INSTRUMENTATION_KEY \
-		$storageArgs \
-		$buildMetadataArgs \
+		--build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$dockerFileToBuild" \
 		.
 
@@ -182,17 +161,6 @@ function createImageNameWithReleaseTag() {
 	fi
 }
 
-function buildBuildScriptGeneratorImage() {
-	# Create the following image so that it's contents can be copied to the rest of the images below
-	echo
-	echo "-------------Creating build script generator image-------------------"
-	docker build -t buildscriptgenerator \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
-		$buildMetadataArgs \
-		-f "$BUILD_IMAGES_BUILDSCRIPTGENERATOR_DOCKERFILE" \
-		.
-}
-
 function buildGitHubRunnersBaseImage() {
 	echo
 	echo "-------------Building the image which uses GitHub runners' buildpackdeps-stretch specific digest----------------------------"
@@ -201,19 +169,42 @@ function buildGitHubRunnersBaseImage() {
 		.
 }
 
+function buildTemporaryFilesImage() {
+	buildGitHubRunnersBaseImage
+	
+	# Create the following image so that it's contents can be copied to the rest of the images below
+	echo
+	echo "-------------Creating temporary files image-------------------"
+	docker build -t tempfiles \
+		-f "$BUILD_IMAGES_TEMPORARY_FILES_DOCKERFILE" \
+		.
+}
+
+function buildBuildScriptGeneratorImage() {
+	buildTemporaryFilesImage
+
+	# Create the following image so that it's contents can be copied to the rest of the images below
+	echo
+	echo "-------------Creating build script generator image-------------------"
+	docker build -t buildscriptgenerator \
+		--build-arg AGENTBUILD=$BUILD_SIGNED \
+		--build-arg GIT_COMMIT=$GIT_COMMIT \
+		--build-arg BUILD_NUMBER=$BUILD_NUMBER \
+		--build-arg RELEASE_TAG_NAME=$RELEASE_TAG_NAME \
+		-f "$BUILD_IMAGES_BUILDSCRIPTGENERATOR_DOCKERFILE" \
+		.
+}
+
 function buildGitHubActionsImage() {
 	buildBuildScriptGeneratorImage
-	buildGitHubRunnersBaseImage
-
+	
 	echo
 	echo "-------------Creating build image for GitHub Actions-------------------"
 	builtImageName="$ACR_BUILD_GITHUB_ACTIONS_IMAGE_NAME"
 	docker build -t $builtImageName \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
-		$BASE_TAG_BUILD_ARGS \
 		--build-arg AI_KEY=$APPLICATION_INSIGHTS_INSTRUMENTATION_KEY \
-		$storageArgs \
-		$buildMetadataArgs \
+		--build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$BUILD_IMAGES_GITHUB_ACTIONS_DOCKERFILE" \
 		.
 
@@ -234,11 +225,9 @@ function buildJamStackImage() {
 	echo "-------------Creating AzureFunctions JamStack image-------------------"
 	builtImageName="$ACR_AZURE_FUNCTIONS_JAMSTACK_IMAGE_NAME"
 	docker build -t $builtImageName \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
-		$BASE_TAG_BUILD_ARGS \
 		--build-arg AI_KEY=$APPLICATION_INSIGHTS_INSTRUMENTATION_KEY \
-		$buildMetadataArgs \
-		$storageArgs \
+		--build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$BUILD_IMAGES_AZ_FUNCS_JAMSTACK_DOCKERFILE" \
 		.
 	echo
@@ -263,6 +252,11 @@ function buildLtsVersionsImage() {
 function buildFullImage() {
 	buildLtsVersionsImage
 
+	# Pull and tag the image with the name that the full image's Dockerfile expects
+	yarnImage="mcr.microsoft.com/oryx/base:build-yarn-cache-$YARN_CACHE_BASE_TAG"
+	docker pull $yarnImage
+	docker tag $yarnImage yarn-cache-base
+
 	echo
 	echo "-------------Creating full build image-------------------"
 	buildDockerImage "$BUILD_IMAGES_DOCKERFILE" \
@@ -279,10 +273,9 @@ function buildVsoImage() {
 	echo "-------------Creating VSO build image-------------------"
 	builtImageName="$ACR_BUILD_VSO_IMAGE_NAME"
 	docker build -t $builtImageName \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
 		--build-arg AI_KEY=$APPLICATION_INSIGHTS_INSTRUMENTATION_KEY \
-		$storageArgs \
-		$buildMetadataArgs \
+		--build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$BUILD_IMAGES_VSO_DOCKERFILE" \
 		.
 	echo
@@ -297,10 +290,9 @@ function buildCliImage() {
 	echo "-------------Creating CLI image-------------------"
 	builtImageTag="$ACR_CLI_BUILD_IMAGE_REPO:latest"
 	docker build -t $builtImageTag \
-		--build-arg AGENTBUILD=$BUILD_SIGNED \
-		$BASE_TAG_BUILD_ARGS \
 		--build-arg AI_KEY=$APPLICATION_INSIGHTS_INSTRUMENTATION_KEY \
-		$buildMetadataArgs \
+		--build-arg SDK_STORAGE_BASE_URL_VALUE=$PROD_SDK_CDN_STORAGE_BASE_URL \
+		--label com.microsoft.oryx="$labelContent" \
 		-f "$BUILD_IMAGES_CLI_DOCKERFILE" \
 		.
 	echo
@@ -380,3 +372,15 @@ if [ -z "$BUILD_SIGNED" ]
 then
 	rm -rf binaries
 fi
+
+echo
+echo "github-actions history"
+docker history oryxdevmcr.azurecr.io/public/oryx/build:github-actions
+
+echo
+echo "Lts-versions history"
+docker history oryxdevmcr.azurecr.io/public/oryx/build:lts-versions
+
+echo
+echo "Full image history"
+docker history oryxdevmcr.azurecr.io/public/oryx/build
